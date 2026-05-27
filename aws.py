@@ -52,7 +52,7 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 
-def error(msg: str) -> None:
+def error(msg) -> Exception:
     print('Error:', msg, file=sys.stderr)
     sys.exit(1)
 
@@ -153,7 +153,7 @@ def get_sso_session(create=False):
     base = OIDC_URL.format(region)
 
     reg = post_json(f'{base}/client/register', {
-        'clientName': 'aws-sso-python',
+        'clientName': 'aws.py',
         'clientType': 'public',
         'scopes': scopes,
     })
@@ -1004,7 +1004,7 @@ def authenticate(sso_id, sso_region, account_id, role_name, region=None):
 
     scopes = ['sso:account:access']
     reg = request(url=f'{base}/client/register', data={
-        'clientName': 'aws-sso-python',
+        'clientName': 'aws.py',
         'clientType': 'public',
         'scopes': scopes,
     }).load()
@@ -1091,12 +1091,3 @@ __all__ = ['RX']
 
 if __name__ == '__main__':
     main()
-
-    # while True:
-    #     with pathlib.Path('/tmp/aws-sso.log').open('a+') as fp:
-    #         fp.write(f'{dt.datetime.now().isoformat()}\n')
-    #     time.sleep(1)
-
-    # while True:
-    #     time.sleep(1)
-    #     print(pathlib.Path('/tmp/aws-sso.log').read_text())

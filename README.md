@@ -1,8 +1,8 @@
-# aws-sso
+# aws.py
 
 ```shell
 # Download the script
-curl -O https://raw.githubusercontent.com/andreif/aws-sso/main/aws.py
+curl -O https://raw.githubusercontent.com/andreif/aws.py/main/aws.py
 
 # Only allow your current user to access it
 chmod 0700 aws.py
