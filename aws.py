@@ -1,5 +1,8 @@
 #!/usr/bin/python3
 import asyncio
+import dataclasses
+import hashlib
+import hmac
 import re
 import signal
 import sys
@@ -15,7 +18,9 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import datetime as dt
-from typing import Any, Optional
+import xml.etree.ElementTree
+from functools import lru_cache
+from typing import Any, Optional, Mapping, Union, Sequence, Dict, Tuple
 
 assert (_ := sys.version_info) > (3, 9), _
 
@@ -101,21 +106,6 @@ def get_profile_config(name, require=False, resolve=True):
         raise error(f'No [profile <name>] found in {AWS_CONFIG_PATH}')
     else:
         return None
-
-
-def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    print(url)
-    req = urllib.request.Request(
-        url=url,
-        data=json.dumps(payload).encode(),
-        headers={'Content-Type': 'application/json'},
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors='ignore')
-        raise RuntimeError(f'HTTP {e.code} POST {url}: {body}')
 
 
 def get_sso_session(create=False):
@@ -228,6 +218,58 @@ def get_sso_session(create=False):
         raise error('Aborted.')
 
 
+@dataclasses.dataclass
+class Response:
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+
+    def load(self) -> dict:
+        if self.body.startswith(b"<"):
+            return xml_to_dict(self.body)
+        return json.loads(self.body)
+
+
+def request(*, url, headers=None, method=None, query=None, data=None, timeout=None, raise_for_status=False) -> Response:
+    headers = headers or {}
+    if data and not isinstance(data, (bytes, str)):
+        data = json.dumps(data).encode()
+        headers.setdefault('Content-Type', 'application/json')
+    if isinstance(data, str):
+        data = data.encode()
+    method = method or ('POST' if data is not None else 'GET')
+    if query:
+        url += '?' + urllib.parse.urlencode(query, safe='-_.~')
+    req = urllib.request.Request(url=url, method=method.upper(), headers=headers, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.getcode()
+            headers = {k: v for k, v in resp.getheaders()}
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        status = e.code
+        headers = {k: v for k, v in e.headers.items()},
+        body = e.read()
+    if raise_for_status and status > 300:
+        raise Exception(f"HTTP {status}: {body}")
+    return Response(status=status, headers=headers, body=body)
+
+
+def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    print(url)
+    req = urllib.request.Request(
+        url=url,
+        data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors='ignore')
+        raise RuntimeError(f'HTTP {e.code} POST {url}: {body}')
+
+
 def portal(path, token, region, **query):
     while not SHUTDOWN.is_set():
         url = PORTAL_URL.format(region) + path
@@ -338,8 +380,8 @@ def get_role_session(account_id, role_name, region=None):
                 'AWS_SECRET_ACCESS_KEY': rc['secretAccessKey'],
                 'AWS_SESSION_TOKEN': rc['sessionToken'],
                 # 'AWS_CREDENTIAL_EXPIRATION': _utc_iso(rc['expiration']),
-                'AWS_REGION': region or '',
-                'AWS_DEFAULT_REGION': region or '',
+                'AWS_REGION': (_ := region or session['region']),
+                'AWS_DEFAULT_REGION': _,
             }
     return None
 
@@ -441,12 +483,19 @@ def serve():
                         print(f"Rejected {addr}")
                         continue
 
+                    def _sendall(x):
+                        if isinstance(x, str):
+                            x = x.encode()
+                        if not isinstance(x, bytes):
+                            x = repr(x).encode()
+                        c.sendall(x)
+
                     try:
                         _args = json.loads(c.recv(1024))
                         assert isinstance(_args, list)
                     except Exception as e:
                         print(e)
-                        c.sendall(repr(e).encode())
+                        _sendall(e)
                         continue
                     else:
                         print(_args)
@@ -462,46 +511,50 @@ def serve():
                                     lines.append(f'{account_id} {account_name}:')
                                     for _ in roles:
                                         lines.append(f'  - {_}')
-                            c.sendall('\n'.join(lines).encode())
+                            _sendall('\n'.join(lines))
                             continue
 
-                        if '--region' in _args:
-                            # TODO: use argparse for aws-vault args?
-                            assert _args.index('--region') == 1 and len(_args) == 3, _args
-                            region = _args[2]
-                            _args = _args[:1]
+                        for _ in _args:
+                            if RX.REGION.match(_):
+                                region = _
+                        _args = [_ for _ in _args if not RX.REGION.match(_) and not _ == '--region']
 
+                        chain = {}
                         if len(_args) == 1 and (p := get_profile_config(_args[0])):
                             print(p)
-                            if _ := p.get('sso_account_id'):
-                                account_id = _
+                            while _ := p.get('source_profile'):
+                                if _ in chain:
+                                    break
+                                chain[_] = p
+                                p = get_profile_config(_)
+                                print(p)
+
+                            if account_id := p.get('sso_account_id'):
                                 role_name = p['sso_role_name']
                                 region = region or p.get('region')
                                 duration = p.get('duration_seconds')
-                            elif _ := p.get('source_profile'):
-                                raise NotImplementedError
                             else:
-                                c.sendall(f"Invalid profile: {_args[0]} {p}".encode())
+                                _sendall(f"Invalid profile: {_args[0]} {chain} {p}")
                         else:
                             for a in _args:
+                                if isinstance(a, int):
+                                    a = str(a)
                                 if a.isdigit():
                                     if len(a) == 12:
                                         account_id = a
                                     else:
                                         duration = a
                                 elif '-' in a:
-                                    if RX.REGION.match(a):
-                                        region = a
-                                    elif _ := aliases.get(a):
+                                    if _ := aliases.get(a):
                                         account_id = _
                                     else:
                                         # TODO: profile, chaining
-                                        c.sendall(f"No access to account {a}, accessible: {aliases}".encode())
+                                        _sendall(f"No access to account {a}, accessible: {aliases}")
                                         break
                                 else:
                                     role_name = a
                         if not account_id:
-                            c.sendall("Account ID, or name, or profile name are missing".encode())
+                            _sendall("Account ID, or name, or profile name are missing")
                             continue
                         role_name = {
                             'admin': 'AdministratorAccess',
@@ -511,16 +564,34 @@ def serve():
 
                         roles = get_roles(account_id=account_id)
                         if role_name not in roles:
-                            c.sendall(f"Invalid role name {role_name}, allowed: {roles}".encode())
+                            _sendall(f"Invalid role name {role_name}, allowed: {roles}")
                         else:
-                            _ = get_role_session(account_id=account_id, role_name=role_name, region=region)
-                            c.sendall(json.dumps(_).encode())
+                            ss = get_role_session(account_id=account_id, role_name=role_name, region=region)
+                            while chain:
+                                k, _ = chain.popitem()
+                                print("CHAIN:", k)
+                                _ = query_api(
+                                    action="sts:AssumeRole",
+                                    params={"RoleArn": _['role_arn'], "RoleSessionName": k},
+                                    region=(region := _.get('region') or region),
+                                    access_key=ss['AWS_ACCESS_KEY_ID'],
+                                    secret_key=ss['AWS_SECRET_ACCESS_KEY'],
+                                    session_token=ss['AWS_SESSION_TOKEN'],
+                                ).load()['AssumeRoleResponse']['AssumeRoleResult']['Credentials']
+                                ss = {
+                                    'AWS_ACCESS_KEY_ID': _['AccessKeyId'],
+                                    'AWS_SECRET_ACCESS_KEY': _['SecretAccessKey'],
+                                    'AWS_SESSION_TOKEN': _['SessionToken'],
+                                    'AWS_REGION': region,
+                                    'AWS_DEFAULT_REGION': region,
+                                }
+                            _sendall(json.dumps(ss))
     finally:
         SHUTDOWN.set()
         thread.join()
 
 
-def request(data):
+def send(data):
     while True and not SHUTDOWN.is_set():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -538,6 +609,26 @@ def request(data):
 
             s.close()
             return r
+
+
+def auth(*args, **kwargs):
+    _ = send(args)
+    try:
+        _ = json.loads(_)
+    except Exception as e:
+        raise error(f"{e} {_}")
+    else:
+        if kwargs.get('boto3'):
+            import boto3
+            from botocore.exceptions import ClientError
+            _ = boto3.Session(
+                aws_session_token=_['AWS_SESSION_TOKEN'],
+                aws_secret_access_key=_['AWS_SECRET_ACCESS_KEY'],
+                aws_access_key_id=_['AWS_ACCESS_KEY_ID'],
+                region_name=_['AWS_REGION'],
+            )
+            _.Error = ClientError
+            return _
 
 
 def start_server():
@@ -564,19 +655,22 @@ def is_running():
 
 
 def main():
+    exe = sys.argv[0]
     args = sys.argv[1:]
-    print('args', args, file=sys.stderr)
-    print('server', get_server(), file=sys.stderr)
+    if os.getenv('DEBUG'):
+        print('args', args, file=sys.stderr)
+        print('server', get_server(), file=sys.stderr)
 
     if not args:
         print('Example usage:')
-        print(' - aws-sso $ACCOUNT_NAME [$ROLE_NAME] [$REGION] -- aws s3 ls')
-        print(' - aws-sso $ACCOUNT_ID -- aws sts get-caller-identity # uses read-only role by default')
-        print(' - aws-sso $POFILE -- aws ...  # uses profile from ~/.aws/config')
-        print(' - aws-sso serve               # starts token server')
-        print(' - aws-sso stop                # stops the server')
-        print(' - aws-sso -l                  # list SSO accounts and roles')
-        print(' - aws-sso -l                  # list profiles from ~/.aws/config')
+        _ = f' - {exe} '
+        print(_ + '$ACCOUNT_NAME [$ROLE_NAME] [$REGION] -- aws s3 ls')
+        print(_ + '$ACCOUNT_ID -- aws sts get-caller-identity # uses read-only role by default')
+        print(_ + '$POFILE -- aws ...  # uses profile from ~/.aws/config')
+        print(_ + 'serve               # starts token server')
+        print(_ + 'stop                # stops the server')
+        print(_ + '-l                  # list SSO accounts and roles')
+        print(_ + '-p                  # list profiles from ~/.aws/config')
 
     elif args in (['serve'], ['start']):
         serve()
@@ -585,7 +679,7 @@ def main():
         stop_server()
 
     elif args == ['-l']:
-        if _ := request(data=args).strip():
+        if _ := send(data=args).strip():
             print(_.decode())
 
     elif args == ['-p']:
@@ -618,7 +712,7 @@ def main():
         if not is_running():
             start_server()
 
-        if _ := request(data=sso_args).strip():
+        if _ := send(data=sso_args).strip():
             if _[:1] != b'{':
                 raise error(_.decode())
             os.environ.update(json.loads(_))
@@ -627,6 +721,369 @@ def main():
                 env={'PYTHONUNBUFFERED': '1', 'FORCE_COLOR': '1', **os.environ, **json.loads(_)},
             )
             proc.wait()
+
+
+@lru_cache(maxsize=None)
+def get_secret(secret_id) -> str:
+    return json_api(
+        target='secretsmanager.GetSecretValue',
+        payload={'SecretId': secret_id, 'VersionStage': 'AWSCURRENT'},
+    ).load()['SecretString']
+
+
+def xml_to_dict(elem: Union[str, bytes, xml.etree.ElementTree.Element]):
+    if isinstance(elem, (str, bytes)):
+        elem = xml.etree.ElementTree.fromstring(elem)
+    tag = elem.tag.split("}")[-1]
+    d = {tag: {} if elem.attrib else None}
+    children = list(elem)
+    if children:
+        dd = {}
+        for dc in map(xml_to_dict, children):
+            for k, v in dc.items():
+                if k in dd:
+                    if not isinstance(dd[k], list):
+                        dd[k] = [dd[k]]
+                    dd[k].append(v)
+                else:
+                    dd[k] = v
+        d = {tag: dd}
+    if elem.attrib:
+        d[tag].update({f"@{k}": v for k, v in elem.attrib.items()})
+    if elem.text and elem.text.strip():
+        text = elem.text.strip()
+        if children or elem.attrib:
+            d[tag]["#text"] = text
+        else:
+            d[tag] = text
+    return d
+
+
+def sigv4_api(
+    *,
+    service: str = None,
+    method: str = 'GET',
+    region: Optional[str] = None,
+    host: Optional[str] = None,           # e.g. "execute-api.us-east-1.amazonaws.com" (if None -> "{service}.{region}.amazonaws.com")
+    path: str = "/",                        # canonical path, already URL-encoded where necessary
+    query: Optional[Union[str, Mapping[str, Union[str, int, Sequence[Union[str, int]]]]]] = None,  # dict or raw query string
+    headers: Optional[Mapping[str, str]] = None,   # additional headers (e.g. {"Content-Type": "...", "X-Amz-Target": "..."} )
+    body: Optional[Union[bytes, str, Mapping]] = None,  # bytes | str | JSON-serializable (auto-serialized if Content-Type is JSON)
+    timeout: Optional[float] = None,
+    access_key: str = None,
+    secret_key: str = None,
+    session_token: str = None,
+) -> Response:
+    access_key = access_key or os.getenv('AWS_ACCESS_KEY_ID')
+    secret_key = secret_key or os.getenv('AWS_SECRET_ACCESS_KEY')
+    session_token = session_token or os.getenv('AWS_SESSION_TOKEN')
+    if host:
+        _ = host.split('.')
+        service = service or _[-4]
+        region = region or _[-3]
+    if not region:
+        region = os.getenv('AWS_REGION') or os.getenv('AWS_DEFAULT_REGION')
+    assert service and region
+
+    # --- Endpoint/host ---
+    _host = host or f"{service}.{region}.amazonaws.com"
+    scheme = "https"
+    # Build querystring (raw or from mapping)
+    canonical_qs, url_qs = _build_qs(query)
+    endpoint = f"{scheme}://{_host}{path}{url_qs}"
+
+    # --- Body handling & Content-Type defaulting ---
+    req_headers: Dict[str, str] = {}
+    if headers:
+        # copy without changing case here; canonicalization happens later with lowercasing
+        req_headers.update(headers)
+
+    content_type = req_headers.get("Content-Type")
+    if isinstance(body, (dict, list)):
+        # If JSON given but no Content-Type, default to AWS JSON
+        if not content_type:
+            # Many AWS JSON services accept this content type
+            content_type = "application/x-amz-json-1.1"
+            req_headers["Content-Type"] = content_type
+        body_bytes = json.dumps(body, separators=(",", ":")).encode()
+    elif isinstance(body, str):
+        body_bytes = body.encode()
+    elif body is None:
+        body_bytes = b""
+    else:
+        assert isinstance(body, bytes)
+        body_bytes = body  # bytes
+
+    # --- Dates ---
+    amz_date = now().strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now().strftime("%Y%m%d")
+
+    # --- Canonical request pieces ---
+    # Required signing headers
+    signing_headers = {
+        "host": _host,
+        "x-amz-date": amz_date,
+        "x-amz-security-token": session_token,
+    }
+
+    # Bring in user headers (lowercased for signing), merging carefully
+    if req_headers:
+        for k, v in req_headers.items():
+            lk = k.lower()
+            # Normalize whitespace per AWS rules
+            signing_headers[lk] = " ".join(str(v).strip().split())
+
+    # Canonical headers/signed headers
+    sorted_header_items = sorted(signing_headers.items())
+    canonical_headers = "".join(f"{k}:{v}\n" for k, v in sorted_header_items)
+    signed_headers = ";".join(k for k, _ in sorted_header_items)
+    payload_hash = hashlib.sha256(body_bytes).hexdigest()
+
+    def _canonical_uri(_: str) -> str:
+        # Must be URI-encoded with safe "-_.~/"
+        # Assume input is either raw or already encoded; encode only unsafe characters.
+        return urllib.parse.quote(_ if _ else "/", safe="/-_.~")
+
+    canonical_request = "\n".join([
+        method.upper(),
+        _canonical_uri(path),
+        canonical_qs,
+        canonical_headers,
+        signed_headers,
+        payload_hash,
+    ]).encode()
+
+    # --- String to sign ---
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join([
+        algorithm, amz_date, credential_scope, hashlib.sha256(canonical_request).hexdigest(),
+    ]).encode()
+
+    # --- Derive signing key & signature ---
+    def _hmac(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + secret_key).encode(), datestamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, service)
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign, hashlib.sha256).hexdigest()
+
+    # --- Final request headers (proper casing for network) ---
+    final_headers = dict(req_headers) if req_headers else {}
+    final_headers["Authorization"] = (
+        f"{algorithm} Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    final_headers["X-Amz-Date"] = amz_date
+    final_headers["x-amz-content-sha256"] = payload_hash
+    final_headers["Host"] = _host
+    if session_token:
+        final_headers["X-Amz-Security-Token"] = session_token
+
+    return request(
+        method=method,
+        url=endpoint,
+        headers=final_headers,
+        data=body_bytes if method.upper() != "GET" else None,
+    )
+
+
+def _build_qs(
+    query: Optional[Union[str, Mapping[str, Union[str, int, Sequence[Union[str, int]]]]]]
+) -> Tuple[str, str]:
+    """
+    Returns (canonical_qs_for_signing, url_qs_for_request)
+    Canonicalization per AWS: sort by key, then value; encode with safe '-_.~'
+    """
+    def _canonicalize_query_mapping(mapping: Mapping[str, Sequence[str]]) -> str:
+        enc = lambda s: urllib.parse.quote(s, safe="-_.~")
+        items = []
+        for k, values in mapping.items():
+            for v in values:
+                items.append((enc(k), enc(v)))
+        # Sort by key, then value
+        items.sort(key=lambda kv: (kv[0], kv[1]))
+        return "&".join(f"{k}={v}" for k, v in items)
+
+    if query is None:
+        return "", ""
+    if isinstance(query, str):
+        # Use as-is for URL; for signing, we must canonicalize
+        parsed = urllib.parse.parse_qs(query, keep_blank_values=True, strict_parsing=False)
+        return _canonicalize_query_mapping(parsed), query
+    # Mapping path
+    # Normalize values to list of strings
+    norm: Dict[str, Sequence[str]] = {}
+    for k, v in query.items():
+        if isinstance(v, (list, tuple)):
+            norm[str(k)] = [str(x) for x in v]
+        else:
+            norm[str(k)] = [str(v)]
+    canonical = _canonicalize_query_mapping(norm)
+    # For URL query, we can use urllib to encode (order not strictly required for request URL)
+    _items = []
+    for k, values in norm.items():
+        for val in values:
+            _items.append((k, val))
+    url_qs = '?' + urllib.parse.urlencode(_items, doseq=True, safe="-_.~") if _items else ''
+    return canonical, url_qs
+
+
+def json_api(
+    *,
+    target: Optional[str],
+    payload: Union[Mapping, Sequence, None],
+    service: Optional[str] = None,
+    region: Optional[str] = None,
+    host: Optional[str] = None,
+    uri: str = "/",
+    method: str = "POST",
+    timeout: Optional[float] = None,
+) -> Response:
+    """
+    For AWS JSON RPC-style APIs (e.g., Secrets Manager, STS JSON variants, Comprehend, etc.).
+    """
+    if target and not service:
+        service = target.split(".")[0]
+    assert service
+    headers = {"Content-Type": "application/x-amz-json-1.1"}
+    if target:
+        headers["X-Amz-Target"] = target
+    return sigv4_api(
+        method=method,
+        service=service,
+        region=region,
+        host=host,
+        path=uri,
+        headers=headers,
+        body=payload if payload is not None else {},
+        timeout=timeout,
+    )
+
+
+def query_api(
+    action: str,
+    params: Optional[Mapping[str, Union[str, int, Sequence[Union[str, int]]]]] = None,
+    region: Optional[str] = None,
+    host: Optional[str] = None,
+    version: Optional[str] = None,
+    timeout: Optional[float] = None,
+    access_key: str = None,
+    secret_key: str = None,
+    session_token: str = None,
+) -> Response:
+    """
+    For AWS "Query" APIs (e.g., STS, IAM, CloudFormation, Route53, SNS, some older services).
+    """
+    service, action = action.split(":")
+    q = dict(params or {})
+    host = host or {'sts': f'sts.{region}.amazonaws.com'}[service]
+    q["Version"] = version or {'sts': '2011-06-15'}[service]
+    q["Action"] = action
+    return sigv4_api(
+        method="POST",
+        service=service,
+        region=region,
+        host=host,
+        path="/",
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        # Body must be the form-encoded params for Query APIs
+        body=urllib.parse.urlencode(q, doseq=True, safe="-_.~"),
+        timeout=timeout,
+        access_key=access_key,
+        secret_key=secret_key,
+        session_token=session_token,
+    )
+
+
+def authenticate(sso_id, sso_region, account_id, role_name, region=None):
+    start_url = f'https://{sso_id}.awsapps.com/start'
+    base = f'https://oidc.{sso_region}.amazonaws.com'
+
+    scopes = ['sso:account:access']
+    reg = request(url=f'{base}/client/register', data={
+        'clientName': 'aws-sso-python',
+        'clientType': 'public',
+        'scopes': scopes,
+    }).load()
+    client_id = reg['clientId']
+    client_secret = reg['clientSecret']
+
+    dev: Dict[str, Union[str, int]] = request(url=f'{base}/device_authorization', data={
+        'clientId': client_id,
+        'clientSecret': client_secret,
+        'startUrl': start_url,
+    }).load()
+
+    print('Authorize:', dev['userCode'])
+    os.system('open ' + dev['verificationUriComplete'])
+
+    interval = dev['interval']
+    expires_at = now() + dt.timedelta(seconds=dev['expiresIn'])
+
+    # Poll /token until authorized or expired
+    while now() < expires_at:
+        session = request(url=f'{base}/token', data={
+            'grantType': 'urn:ietf:params:oauth:grant-type:device_code',
+            'deviceCode': dev['deviceCode'],
+            'clientId': client_id,
+            'clientSecret': client_secret,
+            'scope': scopes,
+        }).load()
+        if msg := session.get('error'):
+            # Handle polling errors per RFC 8628 / service semantics
+            if 'authorization_pending' in msg:
+                time.sleep(interval)
+                continue
+            if 'slow_down' in msg:
+                interval += 1
+                time.sleep(interval)
+                continue
+            if 'expired_token' in msg or 'access_denied' in msg:
+                raise error(msg)
+            # Other HTTP errors
+            raise error(msg)
+        else:
+            if data := call_portal(
+                path='/federation/credentials',
+                token=session['accessToken'],
+                region=sso_region,
+                account_id=account_id,
+                role_name=role_name,
+            ):
+                if rc := data.get('roleCredentials'):
+                    os.environ.update({
+                        'AWS_ACCESS_KEY_ID': rc['accessKeyId'],
+                        'AWS_SECRET_ACCESS_KEY': rc['secretAccessKey'],
+                        'AWS_SESSION_TOKEN': rc['sessionToken'],
+                        'AWS_REGION': region or '',
+                    })
+                    return
+                else:
+                    raise error("No roleCredentials in response")
+
+    if now() > expires_at:
+        raise error('Timed out waiting for authorization.')
+    else:
+        raise error('Aborted.')
+
+
+def call_portal(path, token, region, **query):
+    while True:
+        r = request(
+            url=f'https://portal.sso.{region}.amazonaws.com' + path,
+            headers={'Accept': 'application/json', 'x-amz-sso_bearer_token': token},
+            query=query,
+            timeout=30,
+        )
+        if r.status == 429:
+            time.sleep(1)
+            continue
+        elif r.status > 300:
+            raise error(f'Failed to connect to portal: {r.status}')
+        return r.load()
 
 
 __all__ = ['RX']
