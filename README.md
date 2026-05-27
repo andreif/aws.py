@@ -1,6 +1,6 @@
 # aws.py
 
-```shell
+```sh
 # Download the script
 curl -O https://raw.githubusercontent.com/andreif/aws.py/main/aws.py
 
