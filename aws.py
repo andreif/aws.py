@@ -382,6 +382,7 @@ def get_role_session(account_id, role_name, region=None):
                 # 'AWS_CREDENTIAL_EXPIRATION': _utc_iso(rc['expiration']),
                 'AWS_REGION': (_ := region or session['region']),
                 'AWS_DEFAULT_REGION': _,
+                'AWS_ACCOUNT': account_id,
             }
     return None
 
@@ -568,12 +569,12 @@ def serve():
                         else:
                             ss = get_role_session(account_id=account_id, role_name=role_name, region=region)
                             while chain:
-                                k, _ = chain.popitem()
+                                k, v = chain.popitem()
                                 print("CHAIN:", k)
                                 _ = query_api(
                                     action="sts:AssumeRole",
-                                    params={"RoleArn": _['role_arn'], "RoleSessionName": k},
-                                    region=(region := _.get('region') or region),
+                                    params={"RoleArn": v['role_arn'], "RoleSessionName": k},
+                                    region=(region := v.get('region') or region),
                                     access_key=ss['AWS_ACCESS_KEY_ID'],
                                     secret_key=ss['AWS_SECRET_ACCESS_KEY'],
                                     session_token=ss['AWS_SESSION_TOKEN'],
@@ -584,6 +585,7 @@ def serve():
                                     'AWS_SESSION_TOKEN': _['SessionToken'],
                                     'AWS_REGION': region,
                                     'AWS_DEFAULT_REGION': region,
+                                    'AWS_ACCOUNT': v['role_arn'].split(':')[4],
                                 }
                             _sendall(json.dumps(ss))
     finally:
