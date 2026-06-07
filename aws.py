@@ -123,6 +123,7 @@ def request(*, url, headers=None, method=None, query=None, data=None, timeout=No
     method = method or ('POST' if data is not None else 'GET')
     if query:
         url += '?' + urllib.parse.urlencode(query, safe='-_.~')
+    print(method, url)
     req = urllib.request.Request(url=url, method=method.upper(), headers=headers, data=data)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -164,42 +165,31 @@ def lsof(port):
 
 
 class Server:
-    AWS_CONFIG: Optional[configparser.ConfigParser] = None
     SSO_SESSION: Optional[dict[str, Any]] = None
-    AWS_ROLES: Optional[dict[tuple[str, str, str], Any]] = None
 
     @classmethod
-    def portal(cls, path, token, region, **query):
+    def portal(cls, path, **query):
         while not SHUTDOWN.is_set():
-            url = 'https://portal.sso.{}.amazonaws.com'.format(region) + path
-            if query:
-                url += '?' + urllib.parse.urlencode(query, safe='-_.~')
-            print(url)
             try:
+                session = cls.SSO_SESSION or cls.get_sso_session(create=True)
+                region = session['region']
+                token = session['accessToken']
                 return request(
-                    url=url,
+                    url=f'https://portal.sso.{region}.amazonaws.com{path}',
+                    query=query,
                     headers={'Accept': 'application/json', 'x-amz-sso_bearer_token': token},
                     timeout=30,
                 ).load()
             except HttpError as e:
-                if e.response.status == 429:
-                    wait(0.1)
-                    continue
-                else:
+                if e.response.status != 429:
                     print(e)
                     break
+                wait(0.1)
         return False
 
     @classmethod
-    def get_accounts(cls, session=None):
-        if not session:
-            session = cls.SSO_SESSION
-        if _ := cls.portal(
-                path='/assignment/accounts',
-                token=session['accessToken'],
-                region=session['region'],
-                max_result=100,
-        ):
+    def get_accounts(cls):
+        if _ := cls.portal(path='/assignment/accounts', max_result=100):
             assert not _['nextToken'], _
             # there is also emailAddress
             return {a['accountId']: a['accountName'] for a in _['accountList']}
@@ -207,7 +197,7 @@ class Server:
 
     @classmethod
     def update_accounts(cls, session):
-        if accounts := cls.get_accounts(session=cls.SSO_SESSION):
+        if accounts := cls.get_accounts():
             with LOCK:
                 session['accounts'] = accounts
             return accounts
@@ -397,16 +387,12 @@ class Server:
         return True
 
     @classmethod
-    def get_roles(cls, account_id, session=None):
-        if not session:
-            session = cls.get_sso_session(create=True)
+    def get_roles(cls, account_id):
         if _ := cls.portal(
-                path=f'/assignment/roles',
-                token=session['accessToken'],
-                region=session['region'],
-                account_id=account_id,
-                # next_token=...,
-                max_result=100,
+            path=f'/assignment/roles',
+            account_id=account_id,
+            # next_token=...,
+            max_result=100,
         ):
             assert not _['nextToken'], _
             roles = []
@@ -417,15 +403,13 @@ class Server:
         return None
 
     @classmethod
-    async def get_roles_async(cls, account_ids, session=None):
+    async def get_roles_async(cls, account_ids):
         assert isinstance(account_ids, (list, dict))
-        if not session:
-            session = cls.get_sso_session(create=True)
+        cls.get_sso_session(create=True)
 
         async def task(account_id):
             try:
-                return account_id, await asyncio.to_thread(cls.get_roles, account_id=account_id,
-                                                           session=session)
+                return account_id, await asyncio.to_thread(cls.get_roles, account_id=account_id)
             except Exception as e:
                 print(e)
                 raise
@@ -572,6 +556,8 @@ class Server:
                 }
         return None
 
+
+class Process:
     @classmethod
     def start(cls):
         subprocess.Popen(
@@ -597,6 +583,8 @@ class Server:
 
 
 class Config:
+    AWS_CONFIG: Optional[configparser.ConfigParser] = None
+
     @classmethod
     def list_profiles(cls):
         conf = cls.load_aws_config()
@@ -1070,7 +1058,7 @@ def main():
         Server.serve()
 
     elif args == ['stop']:
-        Server.stop()
+        Process.stop()
 
     elif args == ['-l']:
         if _ := Client.send(data=args).strip():
@@ -1091,8 +1079,8 @@ def main():
             elif (_ := args.pop(0)) != 'exec':
                 sso_args.append(_)
 
-        if not Server.is_running():
-            Server.start()
+        if not Process.is_running():
+            Process.start()
 
         if _ := Client.send(data=sso_args).strip():
             if _[:1] != b'{':  # note: cannot use _[0] here
