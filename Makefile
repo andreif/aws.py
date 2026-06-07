@@ -14,8 +14,8 @@ run: ${path}
 run-yq: ${path}
 	aws.py | yq -P
 
-serve: ${path}
-	aws.py serve
+start: ${path}
+	aws.py start
 
 stop: ${path}
 	aws.py stop
