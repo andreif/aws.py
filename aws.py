@@ -64,6 +64,7 @@ class Response:
     status: int
     headers: Mapping[str, str]
     body: bytes
+    request: urllib.request.Request
 
     def load(self) -> dict:
         if self.body.startswith(b"<"):
@@ -128,10 +129,10 @@ def request(*, url, headers=None, method=None, query=None, data=None, timeout=No
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             headers = {k: v for k, v in resp.getheaders()}
-            response = Response(status=resp.getcode(), headers=headers, body=resp.read())
+            response = Response(status=resp.getcode(), headers=headers, body=resp.read(), request=req)
     except urllib.error.HTTPError as e:
         headers = {k: v for k, v in e.headers.items()}
-        response = Response(status=e.code, headers=headers, body=e.read())
+        response = Response(status=e.code, headers=headers, body=e.read(), request=req)
     if raise_for_status and response.status > 300:
         raise HttpError(response=response)
     return response
@@ -677,7 +678,7 @@ class Client:
     def auth(cls, *args, **kwargs):
         _ = cls.send(args)
         try:
-            _ = json.loads(_)
+            env = json.loads(_)
         except Exception as e:
             raise error(f"{e} {_}")
         else:
@@ -685,13 +686,32 @@ class Client:
                 import boto3
                 from botocore.exceptions import ClientError
                 _ = boto3.Session(
-                    aws_session_token=_['AWS_SESSION_TOKEN'],
-                    aws_secret_access_key=_['AWS_SECRET_ACCESS_KEY'],
-                    aws_access_key_id=_['AWS_ACCESS_KEY_ID'],
-                    region_name=_['AWS_REGION'],
+                    aws_session_token=env['AWS_SESSION_TOKEN'],
+                    aws_secret_access_key=env['AWS_SECRET_ACCESS_KEY'],
+                    aws_access_key_id=env['AWS_ACCESS_KEY_ID'],
+                    region_name=env['AWS_REGION'],
                 )
                 _.Error = ClientError
                 return _
+            else:
+                return env
+
+
+class AwsResponse:
+    response: Response
+
+    def __init__(self, *, response: Response):
+        self.response = response
+
+    def __getitem__(self, item):
+        return self.response.load().get(item)
+
+    def __getattr__(self, name):
+        if name != "response":
+            return self[name]
+
+    def __str__(self):
+        return str(self.response)
 
 
 class API:
@@ -699,7 +719,7 @@ class API:
     def sigv4_api(
         cls,
         *,
-        service: str = '?',
+        service: str = '',
         method: str = 'GET',
         region: Optional[str] = None,
         host: Optional[str] = None,           # e.g. "execute-api.us-east-1.amazonaws.com" (if None -> "{service}.{region}.amazonaws.com")
@@ -708,9 +728,9 @@ class API:
         headers: Optional[Mapping[str, str]] = None,   # additional headers (e.g. {"Content-Type": "...", "X-Amz-Target": "..."} )
         body: Optional[Union[bytes, str, Mapping, Sequence]] = None,  # bytes | str | JSON-serializable (auto-serialized if Content-Type is JSON)
         timeout: Optional[float] = None,
-        access_key: str = '?',
-        secret_key: str = '?',
-        session_token: str = '?',
+        access_key: str = '',
+        secret_key: str = '',
+        session_token: str = '',
     ) -> Response:
         access_key = access_key or os.getenv('AWS_ACCESS_KEY_ID')
         secret_key = secret_key or os.getenv('AWS_SECRET_ACCESS_KEY', '')
@@ -721,7 +741,7 @@ class API:
             region = region or _[-3]
         if not region:
             region = os.getenv('AWS_REGION') or os.getenv('AWS_DEFAULT_REGION')
-        assert service and region
+        assert service and region, (service, region)
 
         # --- Endpoint/host ---
         _host = host or f"{service}.{region}.amazonaws.com"
@@ -880,7 +900,7 @@ class API:
         uri: str = "/",
         method: str = "POST",
         timeout: Optional[float] = None,
-    ) -> Response:
+    ) -> AwsResponse:
         """
         For AWS JSON RPC-style APIs (e.g., Secrets Manager, STS JSON variants, Comprehend, etc.).
         """
@@ -890,7 +910,7 @@ class API:
         headers = {"Content-Type": "application/x-amz-json-1.1"}
         if target:
             headers["X-Amz-Target"] = target
-        return cls.sigv4_api(
+        return AwsResponse(response=cls.sigv4_api(
             method=method,
             service=service,
             region=region,
@@ -899,7 +919,31 @@ class API:
             headers=headers,
             body=payload if payload is not None else {},
             timeout=timeout,
-        )
+        ))
+
+    @classmethod
+    def json_api_iter(
+        cls,
+        target: Optional[str],
+        payload: Union[Mapping, Sequence, None] = None,
+        with_response: bool = False,
+        **kwargs,
+    ):
+        if payload is None:
+            payload = {}
+        if kwargs and isinstance(payload, Mapping):
+            payload = dict(payload, **kwargs)
+        while True:
+            _  = cls.json_api(target=target, payload=payload)
+            if with_response:
+                yield _
+            d = _.response.load()
+            next_token = d.pop('NextToken', None)
+            if len(d) == 1:
+                yield from list(d.values())[0]
+            if not next_token:
+                return
+            payload["NextToken"] = next_token
 
     @classmethod
     def query_api(
@@ -938,102 +982,13 @@ class API:
         )
 
 
-@lru_cache(maxsize=None)
-def get_secret(secret_id) -> str:
-    return API.json_api(
-        target='secretsmanager.GetSecretValue',
-        payload={'SecretId': secret_id, 'VersionStage': 'AWSCURRENT'},
-    ).load()['SecretString']
-
-
-"""
-def authenticate(sso_id, sso_region, account_id, role_name, region=None):
-    start_url = f'https://{sso_id}.awsapps.com/start'
-    base = f'https://oidc.{sso_region}.amazonaws.com'
-
-    scopes = ['sso:account:access']
-    reg = request(url=f'{base}/client/register', data={
-        'clientName': 'aws.py',
-        'clientType': 'public',
-        'scopes': scopes,
-    }).load()
-    client_id = reg['clientId']
-    client_secret = reg['clientSecret']
-
-    dev: Dict[str, Union[str, int]] = request(url=f'{base}/device_authorization', data={
-        'clientId': client_id,
-        'clientSecret': client_secret,
-        'startUrl': start_url,
-    }).load()
-
-    print('Authorize:', dev['userCode'])
-    os.system('open ' + dev['verificationUriComplete'])
-
-    interval = dev['interval']
-    expires_at = now() + dt.timedelta(seconds=dev['expiresIn'])
-
-    # Poll /token until authorized or expired
-    while now() < expires_at:
-        session = request(url=f'{base}/token', data={
-            'grantType': 'urn:ietf:params:oauth:grant-type:device_code',
-            'deviceCode': dev['deviceCode'],
-            'clientId': client_id,
-            'clientSecret': client_secret,
-            'scope': scopes,
-        }).load()
-        if msg := session.get('error'):
-            # Handle polling errors per RFC 8628 / service semantics
-            if 'authorization_pending' in msg:
-                time.sleep(interval)
-                continue
-            if 'slow_down' in msg:
-                interval += 1
-                time.sleep(interval)
-                continue
-            if 'expired_token' in msg or 'access_denied' in msg:
-                raise error(msg)
-            # Other HTTP errors
-            raise error(msg)
-        else:
-            if data := call_portal(
-                path='/federation/credentials',
-                token=session['accessToken'],
-                region=sso_region,
-                account_id=account_id,
-                role_name=role_name,
-            ):
-                if rc := data.get('roleCredentials'):
-                    os.environ.update({
-                        'AWS_ACCESS_KEY_ID': rc['accessKeyId'],
-                        'AWS_SECRET_ACCESS_KEY': rc['secretAccessKey'],
-                        'AWS_SESSION_TOKEN': rc['sessionToken'],
-                        'AWS_REGION': region or '',
-                    })
-                    return
-                else:
-                    raise error("No roleCredentials in response")
-
-    if now() > expires_at:
-        raise error('Timed out waiting for authorization.')
-    else:
-        raise error('Aborted.')
-
-
-def call_portal(path, token, region, **query):
-    while True:
-        r = request(
-            url=f'https://portal.sso.{region}.amazonaws.com' + path,
-            headers={'Accept': 'application/json', 'x-amz-sso_bearer_token': token},
-            query=query,
-            timeout=30,
-        )
-        if r.status == 429:
-            time.sleep(1)
-            continue
-        elif r.status > 300:
-            raise error(f'Failed to connect to portal: {r.status}')
-        return r.load()
-"""
+def authenticate(*args, **kwargs):
+    args = list(args)
+    for k, v in kwargs.items():
+        args += [f'--{k}', v]
+    _ = Client.auth(*args)
+    if isinstance(_, dict):
+        os.environ.update(**_)
 
 
 def main():
