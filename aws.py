@@ -87,7 +87,7 @@ class HttpError(Exception):
 def xml_to_dict(elem: Union[str, bytes, xml.etree.ElementTree.Element]):
     if isinstance(elem, (str, bytes)):
         elem = xml.etree.ElementTree.fromstring(elem)
-    tag = elem.tag.split("}")[-1]
+    tag = elem.tag.split("}")[-1] or ''
     d = {tag: {} if elem.attrib else None}
     children = list(elem)
     if children:
@@ -160,62 +160,13 @@ def lsof(port):
             dict(zip(h, re.split(r'\s+', _, maxsplit=len(h))))
             for _ in lines
         ]
-    return None
+    return []
 
 
 class Server:
     AWS_CONFIG: Optional[configparser.ConfigParser] = None
     SSO_SESSION: Optional[dict[str, Any]] = None
     AWS_ROLES: Optional[dict[tuple[str, str, str], Any]] = None
-
-    @classmethod
-    def load_aws_config(cls):
-        if not AWS_CONFIG_PATH.exists():
-            raise error(f'File not found {AWS_CONFIG_PATH}')
-        c = configparser.ConfigParser()
-        c.read(AWS_CONFIG_PATH)
-
-        data = {}
-        for name, s in c.items():
-            if ' ' in (name := name.strip()):
-                g, name = name.split()
-                _ = data.setdefault(g, {}).setdefault(name, {})
-            else:
-                _ = data.setdefault(name, {})
-            for k, v in s.items():
-                _[k] = v.replace('"', '')
-        with LOCK:
-            cls.AWS_CONFIG = data
-        return cls.AWS_CONFIG
-
-    @classmethod
-    def get_sso_config(cls, name=None):
-        name = name or os.getenv('AWS_SSO_SESSION')
-        config = cls.load_aws_config()
-
-        if not (sessions := config.get('sso-session')):
-            raise error(f'No [sso-session <name>] found in {AWS_CONFIG_PATH}')
-
-        if name:
-            if not (session := sessions.get(name)):
-                raise error(f'Requested sso-session {name!r} not found. Available: {sessions}')
-        else:
-            name, session = list(sessions.items())[0]
-            if len(sessions) > 1:
-                print(f'Warning: multiple sso-sessions found, selecting {name!r} {session}')
-
-        return {'name': name, **session}
-
-    @classmethod
-    def get_profile_config(cls, name, require=False, resolve=True):
-        if c := cls.load_aws_config().get('profile', {}).get(name):
-            if resolve and (_ := c.pop('include_profile', None)):
-                c = {**cls.get_profile_config(_, require=True), **c}
-            return c
-        elif require:
-            raise error(f'No [profile <name>] found in {AWS_CONFIG_PATH}')
-        else:
-            return None
 
     @classmethod
     def portal(cls, path, token, region, **query):
@@ -330,7 +281,7 @@ class Server:
                                 account_roles = asyncio.run(cls.get_roles_async(account_ids=accounts))
                                 lines = []
                                 for account_id, account_name in sorted(accounts.items(), key=lambda x: x[1]):
-                                    if roles := account_roles.get(account_id):
+                                    if roles := account_roles.get(account_id, []):
                                         lines.append(f'{account_id} {account_name}:')
                                         for _ in roles:
                                             lines.append(f'  - {_}')
@@ -343,13 +294,13 @@ class Server:
                             _args = [_ for _ in _args if not RX.REGION.match(_) and not _ == '--region']
 
                             chain = {}
-                            if len(_args) == 1 and (p := cls.get_profile_config(_args[0])):
+                            if len(_args) == 1 and (p := Config.get_profile_config(_args[0])):
                                 print(p)
                                 while _ := p.get('source_profile'):
                                     if _ in chain:
                                         break
                                     chain[_] = p
-                                    p = cls.get_profile_config(_)
+                                    p = Config.get_profile_config(_)
                                     print(p)
 
                                 if account_id := p.get('sso_account_id'):
@@ -390,16 +341,16 @@ class Server:
                                 _sendall(f"Invalid role name {role_name}, allowed: {roles}")
                             else:
                                 ss = cls.get_role_session(account_id=account_id, role_name=role_name, region=region)
-                                while chain:
+                                while chain and ss:
                                     k, v = chain.popitem()
                                     print("CHAIN:", k)
                                     _ = API.query_api(
                                         action="sts:AssumeRole",
                                         params={"RoleArn": v['role_arn'], "RoleSessionName": k},
                                         region=(region := v.get('region') or region),
-                                        access_key=ss['AWS_ACCESS_KEY_ID'],
-                                        secret_key=ss['AWS_SECRET_ACCESS_KEY'],
-                                        session_token=ss['AWS_SESSION_TOKEN'],
+                                        access_key=str(ss['AWS_ACCESS_KEY_ID']),
+                                        secret_key=str(ss['AWS_SECRET_ACCESS_KEY']),
+                                        session_token=str(ss['AWS_SESSION_TOKEN']),
                                     ).load()['AssumeRoleResponse']['AssumeRoleResult']['Credentials']
                                     ss = {
                                         'AWS_ACCESS_KEY_ID': _['AccessKeyId'],
@@ -523,7 +474,7 @@ class Server:
             return None
 
         print('Creating a new session')
-        _ = cls.get_sso_config()
+        _ = Config.get_sso_config()
         start_url = _['sso_start_url']
         region = _['sso_region']
         scopes: list[str] = _['sso_registration_scopes'].split()
@@ -622,25 +573,9 @@ class Server:
         return None
 
     @classmethod
-    def list_profiles(cls):
-        conf = cls.load_aws_config()
-        print('sso-sessions:')
-        for k, v in conf.get('sso-session', {}).items():
-            print(f'  {k}:')
-            for k, v in v.items():
-                print(f'    {k}: {v}')
-        print('profiles:')
-        for _ in sorted(conf.get('profile', {})):
-            print(f'  {_}:')
-            for k, v in cls.get_profile_config(name=_, resolve=False).items():
-                if v.startswith('0'):
-                    v = f'"{v}"'
-                print(f'    {k}: {v}')
-
-    @classmethod
     def start(cls):
         subprocess.Popen(
-            sys.argv[:1] + ['serve'],
+            sys.argv[:1] + ['start'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid,  # start in a new session
@@ -661,9 +596,76 @@ class Server:
         return bool(cls.get())
 
 
+class Config:
+    @classmethod
+    def list_profiles(cls):
+        conf = cls.load_aws_config()
+        print('sso-sessions:')
+        for k, v in conf.get('sso-session', {}).items():
+            print(f'  {k}:')
+            for k, v in v.items():
+                print(f'    {k}: {v}')
+        print('profiles:')
+        for _ in sorted(conf.get('profile', {})):
+            print(f'  {_}:')
+            for k, v in cls.get_profile_config(name=_, resolve=False).items():
+                if v.startswith('0'):
+                    v = f'"{v}"'
+                print(f'    {k}: {v}')
+
+    @classmethod
+    def load_aws_config(cls):
+        if not AWS_CONFIG_PATH.exists():
+            raise error(f'File not found {AWS_CONFIG_PATH}')
+        c = configparser.ConfigParser()
+        c.read(AWS_CONFIG_PATH)
+
+        data = {}
+        for name, s in c.items():
+            if ' ' in (name := name.strip()):
+                g, name = name.split()
+                _ = data.setdefault(g, {}).setdefault(name, {})
+            else:
+                _ = data.setdefault(name, {})
+            for k, v in s.items():
+                _[k] = v.replace('"', '')
+        with LOCK:
+            cls.AWS_CONFIG = data
+        return cls.AWS_CONFIG
+
+    @classmethod
+    def get_sso_config(cls, name=None):
+        name = name or os.getenv('AWS_SSO_SESSION')
+        config = cls.load_aws_config()
+
+        if not (sessions := config.get('sso-session', [])):
+            raise error(f'No [sso-session <name>] found in {AWS_CONFIG_PATH}')
+
+        if name:
+            if not (session := sessions.get(name)):
+                raise error(f'Requested sso-session {name!r} not found. Available: {sessions}')
+        else:
+            name, session = list(sessions.items())[0]
+            if len(sessions) > 1:
+                print(f'Warning: multiple sso-sessions found, selecting {name!r} {session}')
+
+        return {'name': name, **session}
+
+    @classmethod
+    def get_profile_config(cls, name, require=False, resolve=True):
+        if c := cls.load_aws_config().get('profile', {}).get(name):
+            if resolve and (_ := c.pop('include_profile', None)):
+                c = {**cls.get_profile_config(_, require=True), **c}
+            return c
+        elif require:
+            raise error(f'No [profile <name>] found in {AWS_CONFIG_PATH}')
+        else:
+            return None
+
+
 class Client:
     @classmethod
-    def send(cls, data):
+    def send(cls, data) -> bytes:
         while True and not SHUTDOWN.is_set():
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -681,6 +683,7 @@ class Client:
 
                 s.close()
                 return r
+        return b''
 
     @classmethod
     def auth(cls, *args, **kwargs):
@@ -708,21 +711,21 @@ class API:
     def sigv4_api(
         cls,
         *,
-        service: str = None,
+        service: str = '?',
         method: str = 'GET',
         region: Optional[str] = None,
         host: Optional[str] = None,           # e.g. "execute-api.us-east-1.amazonaws.com" (if None -> "{service}.{region}.amazonaws.com")
         path: str = "/",                        # canonical path, already URL-encoded where necessary
         query: Optional[Union[str, Mapping[str, Union[str, int, Sequence[Union[str, int]]]]]] = None,  # dict or raw query string
         headers: Optional[Mapping[str, str]] = None,   # additional headers (e.g. {"Content-Type": "...", "X-Amz-Target": "..."} )
-        body: Optional[Union[bytes, str, Mapping]] = None,  # bytes | str | JSON-serializable (auto-serialized if Content-Type is JSON)
+        body: Optional[Union[bytes, str, Mapping, Sequence]] = None,  # bytes | str | JSON-serializable (auto-serialized if Content-Type is JSON)
         timeout: Optional[float] = None,
-        access_key: str = None,
-        secret_key: str = None,
-        session_token: str = None,
+        access_key: str = '?',
+        secret_key: str = '?',
+        session_token: str = '?',
     ) -> Response:
         access_key = access_key or os.getenv('AWS_ACCESS_KEY_ID')
-        secret_key = secret_key or os.getenv('AWS_SECRET_ACCESS_KEY')
+        secret_key = secret_key or os.getenv('AWS_SECRET_ACCESS_KEY', '')
         session_token = session_token or os.getenv('AWS_SESSION_TOKEN')
         if host:
             _ = host.split('.')
@@ -919,9 +922,9 @@ class API:
         host: Optional[str] = None,
         version: Optional[str] = None,
         timeout: Optional[float] = None,
-        access_key: str = None,
-        secret_key: str = None,
-        session_token: str = None,
+        access_key: str = '?',
+        secret_key: str = '?',
+        session_token: str = '?',
     ) -> Response:
         """
         For AWS "Query" APIs (e.g., STS, IAM, CloudFormation, Route53, SNS, some older services).
@@ -955,6 +958,7 @@ def get_secret(secret_id) -> str:
     ).load()['SecretString']
 
 
+"""
 def authenticate(sso_id, sso_region, account_id, role_name, region=None):
     start_url = f'https://{sso_id}.awsapps.com/start'
     base = f'https://oidc.{sso_region}.amazonaws.com'
@@ -1041,6 +1045,7 @@ def call_portal(path, token, region, **query):
         elif r.status > 300:
             raise error(f'Failed to connect to portal: {r.status}')
         return r.load()
+"""
 
 
 def main():
@@ -1055,11 +1060,11 @@ def main():
         _ = f' - {exe} '
         print(_ + '$ACCOUNT_NAME [$ROLE_NAME] [$REGION] -- aws s3 ls')
         print(_ + '$ACCOUNT_ID -- aws sts get-caller-identity # uses read-only role by default')
-        print(_ + '$POFILE -- aws ...  # uses profile from ~/.aws/config')
-        print(_ + 'serve               # starts token server')
-        print(_ + 'stop                # stops the server')
-        print(_ + '-l                  # list SSO accounts and roles')
-        print(_ + '-p                  # list profiles from ~/.aws/config')
+        print(_ + '$PROFILE -- aws ...  # uses profile from ~/.aws/config')
+        print(_ + 'serve                # starts token server')
+        print(_ + 'stop                 # stops the server')
+        print(_ + '-l                   # list SSO accounts and roles')
+        print(_ + '-p                   # list profiles from ~/.aws/config')
 
     elif args in (['serve'], ['start']):
         Server.serve()
@@ -1072,7 +1077,7 @@ def main():
             print(_.decode())
 
     elif args == ['-p']:
-        Server.list_profiles()
+        Config.list_profiles()
 
     elif '--' not in args:
         raise error('-- is missing in args')
@@ -1092,7 +1097,6 @@ def main():
         if _ := Client.send(data=sso_args).strip():
             if _[:1] != b'{':  # note: cannot use _[0] here
                 raise error(_.decode())
-            os.environ.update(json.loads(_))
             proc = subprocess.Popen(
                 args,
                 env={'PYTHONUNBUFFERED': '1', 'FORCE_COLOR': '1', **os.environ, **json.loads(_)},
