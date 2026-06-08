@@ -19,7 +19,6 @@ import urllib.request
 import urllib.error
 import datetime as dt
 import xml.etree.ElementTree
-from functools import lru_cache
 from typing import Any, Optional, Mapping, Union, Sequence, Dict, Tuple
 
 assert (_ := sys.version_info) > (3, 9), _
@@ -534,18 +533,15 @@ class Server:
     def get_role_session(cls, account_id, role_name, region=None):
         if session := cls.get_sso_session(create=True):
             if data := cls.portal(
-                    path='/federation/credentials',
-                    token=session['accessToken'],
-                    region=session['region'],
-                    account_id=account_id,
-                    role_name=role_name,
+                path='/federation/credentials',
+                account_id=account_id,
+                role_name=role_name,
             ):
                 rc = data.get('roleCredentials') or {}
                 if not rc:
                     raise RuntimeError("No roleCredentials in response")
                 exp = dt.datetime.fromtimestamp(rc['expiration'] / 1000, tz=dt.timezone.utc)
-                print(exp)
-                print(exp - now())
+                print(exp, exp - now())
                 return {
                     'AWS_ACCESS_KEY_ID': rc['accessKeyId'],
                     'AWS_SECRET_ACCESS_KEY': rc['secretAccessKey'],
@@ -892,7 +888,7 @@ class API:
     def json_api(
         cls,
         *,
-        target: Optional[str],
+        target: Optional[str] = None,
         payload: Union[Mapping, Sequence, None],
         service: Optional[str] = None,
         region: Optional[str] = None,
@@ -925,6 +921,7 @@ class API:
     def json_api_iter(
         cls,
         target: Optional[str],
+        service: Optional[str] = None,
         payload: Union[Mapping, Sequence, None] = None,
         with_response: bool = False,
         **kwargs,
@@ -934,7 +931,7 @@ class API:
         if kwargs and isinstance(payload, Mapping):
             payload = dict(payload, **kwargs)
         while True:
-            _  = cls.json_api(target=target, payload=payload)
+            _  = cls.json_api(target=target, payload=payload, service=service)
             if with_response:
                 yield _
             d = _.response.load()
