@@ -166,6 +166,7 @@ def lsof(port):
 
 class Server:
     SSO_SESSION: Optional[dict[str, Any]] = None
+    users = None
 
     @classmethod
     def portal(cls, path, **query):
@@ -210,7 +211,8 @@ class Server:
             wait(seconds=60)
 
     @classmethod
-    def serve(cls):
+    def serve(cls, users=None):
+        cls.users = users
         cls.get_sso_session(create=True)
 
         thread = threading.Thread(target=cls.refresher, daemon=True)
@@ -359,9 +361,9 @@ class Server:
     def verify_client(cls, addr):
         client, server = None, None
         if addr[0] != '127.0.0.1':
-            return print('Invalid address:', addr)
+            return print('⚠️ Invalid address:', addr)
         if len(procs := lsof(port=f'TCP:{addr[1]}')) != 2:
-            return print('Unexpected procs:', procs)
+            return print('⚠️ Unexpected procs:', procs)
         for p in procs:
             n = p['name'].split('->')
             if len(n) == 2:
@@ -371,19 +373,19 @@ class Server:
                 elif t == f'127.0.0.1:{PORT}':
                     client = p
                 else:
-                    return print('Invalid process:', p)
+                    return print('⚠️ Invalid process:', p)
         if not client or client['command'] != 'Python':
-            return print('Invalid client:', client)
+            return print('⚠️ Invalid client:', client)
         if not server or server['command'] != 'Python':
-            return print('Invalid server:', server)
+            return print('⚠️ Invalid server:', server)
         if int(server['pid']) != PID:
             # TODO: react on server swap
             # os.system(f'ps -p {p["pid"]} -o lstart=')
             # os.system(f'ps -p {p["pid"]} -o command=')
             # os.system(f'ps -p {p["pid"]} -o comm=')
-            return print('Invalid server pid:', server['pid'])
-        if client['user'] != server['user']:
-            return print('Invalid client user:', client['user'])
+            return print('⚠️ Invalid server pid:', server['pid'])
+        if client['user'] not in [server['user']] + (cls.users or []):
+            return print('⚠️ Invalid client user:', client['user'])
         return True
 
     @classmethod
@@ -427,7 +429,7 @@ class Server:
             d = now() - dt.datetime.fromisoformat(_['issuedAt'])
             x = dt.timedelta(seconds=_['expiresIn'])
             if d > x:
-                print(f'Session expired: {_["issuedAt"]} {_["expiresIn"]}')
+                print(f'☠️ Session expired: {_["issuedAt"]} {_["expiresIn"]}')
                 with LOCK:
                     cls.SSO_SESSION = None
 
@@ -454,10 +456,10 @@ class Server:
                     with LOCK:
                         cls.SSO_SESSION = None
         if not create:
-            print('No active sso-session, not creating new one')
+            print('🚫 No active sso-session, not creating new one')
             return None
 
-        print('Creating a new session')
+        print('🌿 Creating a new session')
         _ = Config.get_sso_config()
         start_url = _['sso_start_url']
         region = _['sso_region']
@@ -478,8 +480,16 @@ class Server:
             'startUrl': start_url,
         }).load()
 
-        print('Authorize:', dev['userCode'])
-        os.system('open ' + dev['verificationUriComplete'])
+        print('🔮 Authorize:', dev['userCode'])
+        bws = ''
+        for a, b in {
+            'Google Chrome': 'com.google.Chrome',
+            'Firefox': 'org.mozilla.firefox',
+            'Arc': 'company.thebrowser.Browser',
+        }.items():
+            if pathlib.Path(f'/Applications/{a}.app').exists():
+                bws = f'-b {b} '
+        os.system('open ' + bws + dev['verificationUriComplete'])
 
         interval = dev['interval']
         expires_at = now() + dt.timedelta(seconds=dev['expiresIn'])
@@ -995,7 +1005,7 @@ def main():
         print('args', args, file=sys.stderr)
         print('server', Server.get(), file=sys.stderr)
 
-    if not args:
+    if not args or args in (['help'], ['-h'], ['--help']):
         print('Example usage:')
         _ = f' - {exe} '
         print(_ + '$ACCOUNT_NAME [$ROLE_NAME] [$REGION] -- aws s3 ls')
@@ -1006,8 +1016,8 @@ def main():
         print(_ + '-l                   # list SSO accounts and roles')
         print(_ + '-p                   # list profiles from ~/.aws/config')
 
-    elif args in (['serve'], ['start']):
-        Server.serve()
+    elif args[0] in ('serve', 'start'):
+        Server.serve(users=args[1:])
 
     elif args == ['stop']:
         Process.stop()
