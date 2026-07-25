@@ -951,9 +951,9 @@ class API:
         host: Optional[str] = None,
         version: Optional[str] = None,
         timeout: Optional[float] = None,
-        access_key: str = '?',
-        secret_key: str = '?',
-        session_token: str = '?',
+        access_key: str = '',
+        secret_key: str = '',
+        session_token: str = '',
     ) -> Response:
         """
         For AWS "Query" APIs (e.g., STS, IAM, CloudFormation, Route53, SNS, some older services).
@@ -1019,10 +1019,13 @@ def main():
     elif args == ['-p']:
         Config.list_profiles()
 
-    elif '--' not in args:
+    elif '--' not in args and '--json' not in args:
         raise error('-- is missing in args')
 
     else:
+        if need_json := '--json' in args:
+            args = [_ for _ in args if _ != '--json']
+
         sso_args = []
         while args:
             if args[0] == '--':
@@ -1037,11 +1040,19 @@ def main():
         if _ := Client.send(data=sso_args).strip():
             if _[:1] != b'{':  # note: cannot use _[0] here
                 raise error(_.decode())
-            proc = subprocess.Popen(
-                args,
-                env={'PYTHONUNBUFFERED': '1', 'FORCE_COLOR': '1', **os.environ, **json.loads(_)},
-            )
-            proc.wait()
+            env = json.loads(_)
+            if need_json:
+                print(json.dumps({
+                    'AccessKeyId': env['AWS_ACCESS_KEY_ID'],
+                    'SecretAccessKey': env['AWS_SECRET_ACCESS_KEY'],
+                    'SessionToken': env['AWS_SESSION_TOKEN'],
+                }))
+            else:
+                proc = subprocess.Popen(
+                    args,
+                    env={'PYTHONUNBUFFERED': '1', 'FORCE_COLOR': '1', **os.environ, **env},
+                )
+                proc.wait()
 
 
 if __name__ == '__main__':
