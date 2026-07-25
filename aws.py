@@ -151,6 +151,10 @@ def now():
     return dt.datetime.now(tz=dt.timezone.utc)
 
 
+def netstat():
+    return subprocess.run(f'netstat -na -f inet -p tcp'.split(), capture_output=True).stdout.decode()
+
+
 def lsof(port):
     if isinstance(port, int) or isinstance(port, str) and port.isdigit():
         port = f':{port}'
@@ -586,7 +590,7 @@ class Process:
 
     @classmethod
     def is_running(cls):
-        return bool(cls.get())
+        return f'.{PORT}' in netstat()
 
 
 class Config:
